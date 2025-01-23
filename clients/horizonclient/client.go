@@ -163,7 +163,7 @@ func (c *Client) stream(
 		if !(resp.StatusCode >= 200 && resp.StatusCode < 300) {
 			return fmt.Errorf("got bad HTTP status code %d", resp.StatusCode)
 		}
-		defer resp.Body.Close()
+		// defer resp.Body.Close()
 
 		reader := bufio.NewReader(resp.Body)
 
@@ -182,6 +182,7 @@ func (c *Client) stream(
 				// Check if ctx is not canceled
 				select {
 				case <-ctx.Done():
+					resp.Body.Close()
 					return nil
 				default:
 					// Continue
@@ -203,9 +204,11 @@ func (c *Client) stream(
 						// > Once the end of the file is reached, the user agent must dispatch the
 						// > event one final time, as defined below.
 						if nonEmptylinesRead == 0 {
+							resp.Body.Close()
 							break Events
 						}
 					} else {
+						resp.Body.Close()
 						return errors.Wrap(err, "error reading line")
 					}
 				}
@@ -220,6 +223,7 @@ func (c *Client) stream(
 
 			events, err := sse.Decode(strings.NewReader(buffer.String()))
 			if err != nil {
+				resp.Body.Close()
 				return errors.Wrap(err, "error decoding event")
 			}
 
@@ -246,10 +250,12 @@ func (c *Client) stream(
 					err = errors.New("invalid event.Data type")
 				}
 				if err != nil {
+					resp.Body.Close()
 					return err
 				}
 			}
 		}
+		resp.Body.Close()
 	}
 }
 
