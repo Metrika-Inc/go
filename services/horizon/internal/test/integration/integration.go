@@ -14,7 +14,11 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"text/template"
 	"time"
+
+	"github.com/stellar/go/historyarchive"
+	"github.com/stellar/go/ingest/ledgerbackend"
 
 	"github.com/stellar/go/services/horizon/internal/test"
 
@@ -41,23 +45,30 @@ import (
 
 const (
 	StandaloneNetworkPassphrase = "Standalone Network ; February 2017"
-	stellarCorePostgresPassword = "mysecretpassword"
-	horizonDefaultPort          = "8000"
-	adminPort                   = 6060
-	stellarCorePort             = 11626
-	stellarCorePostgresPort     = 5641
-	historyArchivePort          = 1570
-	sorobanRPCPort              = 8080
+	HorizonDefaultPort          = "8000"
+	AdminPort                   = 6060
+	StellarCorePort             = 11626
+	HistoryArchivePort          = 1570
+	StellarRPCPort              = 8080
+	HistoryArchiveUrl           = "http://localhost:1570"
+	CheckpointFrequency         = 8
+)
+
+const (
+	StellarCoreURL = "http://localhost:11626"
 )
 
 const HorizonInitErrStr = "cannot initialize Horizon"
 
 type Config struct {
 	ProtocolVersion           uint32
-	EnableSorobanRPC          bool
+	EnableStellarRPC          bool
+	LogContainers             bool
 	SkipCoreContainerCreation bool
 	CoreDockerImage           string
-	SorobanRPCDockerImage     string
+	StellarRPCDockerImage     string
+	SkipProtocolUpgrade       bool
+	QuickExpiration           bool
 
 	// Weird naming here because bools default to false, but we want to start
 	// Horizon by default.
@@ -81,13 +92,14 @@ type CaptiveConfig struct {
 	binaryPath  string
 	configPath  string
 	storagePath string
-	useDB       bool
 }
 
 type Test struct {
 	t *testing.T
 
-	composePath string
+	composePath       string
+	validatorConfPath string
+	rpcCoreConfPath   string
 
 	config              Config
 	coreConfig          CaptiveConfig
@@ -100,13 +112,18 @@ type Test struct {
 	horizonAdminClient *sdk.AdminClient
 	coreClient         *stellarcore.Client
 
-	webNode       *horizon.App
-	ingestNode    *horizon.App
-	appStopped    *sync.WaitGroup
-	shutdownOnce  sync.Once
-	shutdownCalls []func()
-	masterKey     *keypair.Full
-	passPhrase    string
+	webNode          *horizon.App
+	ingestNode       *horizon.App
+	appStopped       *sync.WaitGroup
+	shutdownOnce     sync.Once
+	shutdownCalls    []func()
+	masterKey        *keypair.Full
+	passPhrase       string
+	coreUpgradeState *CoreUpgradeState
+}
+
+type CoreUpgradeState struct {
+	maxUpgradeLedger uint32
 }
 
 // GetTestConfig returns the default test Config required to run NewTest.
@@ -141,6 +158,16 @@ func NewTest(t *testing.T, config Config) *Test {
 			config.ProtocolVersion = maxSupportedCoreProtocolFromEnv
 		}
 	}
+	validatorParams := validatorCoreConfigTemplatePrams{
+		Accelerate:                            CheckpointFrequency < historyarchive.DefaultCheckpointFrequency,
+		NetworkPassphrase:                     StandaloneNetworkPassphrase,
+		TestingMinimumPersistentEntryLifetime: 65536,
+		TestingSorobanHighLimitOverride:       false,
+	}
+	if config.QuickExpiration {
+		validatorParams.TestingSorobanHighLimitOverride = true
+		validatorParams.TestingMinimumPersistentEntryLifetime = 10
+	}
 	var i *Test
 	if !config.SkipCoreContainerCreation {
 		composePath := findDockerComposePath()
@@ -151,9 +178,13 @@ func NewTest(t *testing.T, config Config) *Test {
 			passPhrase:  StandaloneNetworkPassphrase,
 			environment: test.NewEnvironmentManager(),
 		}
-		i.configureCaptiveCore()
+		i.validatorConfPath = i.createCoreValidatorConf(validatorParams)
+		i.rpcCoreConfPath = i.createCaptiveCoreConf(captiveCoreConfigTemplatePrams{
+			validatorCoreConfigTemplatePrams: validatorParams,
+			ValidatorAddress:                 "core",
+		})
 		// Only run Stellar Core container and its dependencies.
-		i.runComposeCommand("up", "--detach", "--quiet-pull", "--no-color", "core")
+		i.startCoreValidator()
 	} else {
 		i = &Test{
 			t:           t,
@@ -161,14 +192,15 @@ func NewTest(t *testing.T, config Config) *Test {
 			environment: test.NewEnvironmentManager(),
 		}
 	}
+	i.configureCaptiveCore(validatorParams)
 
 	i.prepareShutdownHandlers()
-	i.coreClient = &stellarcore.Client{URL: "http://localhost:" + strconv.Itoa(stellarCorePort)}
+	i.coreClient = &stellarcore.Client{URL: "http://localhost:" + strconv.Itoa(StellarCorePort)}
 	if !config.SkipCoreContainerCreation {
 		i.waitForCore()
-		if i.config.EnableSorobanRPC {
-			i.runComposeCommand("up", "--detach", "--quiet-pull", "--no-color", "soroban-rpc")
-			i.waitForSorobanRPC()
+		if i.config.EnableStellarRPC {
+			i.startRPC()
+			i.waitForStellarRPC()
 		}
 	}
 
@@ -183,12 +215,13 @@ func NewTest(t *testing.T, config Config) *Test {
 	return i
 }
 
-func (i *Test) configureCaptiveCore() {
-	composePath := findDockerComposePath()
+func (i *Test) configureCaptiveCore(validatorParams validatorCoreConfigTemplatePrams) {
 	i.coreConfig.binaryPath = os.Getenv("HORIZON_INTEGRATION_TESTS_CAPTIVE_CORE_BIN")
-	i.coreConfig.configPath = filepath.Join(composePath, "captive-core-integration-tests.cfg")
+	i.coreConfig.configPath = i.createCaptiveCoreConf(captiveCoreConfigTemplatePrams{
+		validatorCoreConfigTemplatePrams: validatorParams,
+		ValidatorAddress:                 "localhost",
+	})
 	i.coreConfig.storagePath = i.CurrentTest().TempDir()
-	i.coreConfig.useDB = true
 
 	if value := i.getIngestParameter(
 		horizon.StellarCoreBinaryPathName,
@@ -214,44 +247,57 @@ func (i *Test) getIngestParameter(argName, envName string) string {
 	return ""
 }
 
+func (i *Test) createCoreValidatorConf(params validatorCoreConfigTemplatePrams) string {
+	tomlFile, err := os.CreateTemp("", "stellar-core-integration-test-*.toml")
+	require.NoError(i.t, err)
+
+	tmpl, err := template.New("core-validator").Parse(validatorCoreConfigTemplate)
+	require.NoError(i.t, err)
+	err = tmpl.Execute(tomlFile, params)
+	require.NoError(i.t, err)
+
+	require.NoError(i.t, tomlFile.Close())
+
+	i.t.Cleanup(func() {
+		require.NoError(i.t, os.Remove(tomlFile.Name()))
+	})
+	return tomlFile.Name()
+}
+
+func (i *Test) createCaptiveCoreConf(params captiveCoreConfigTemplatePrams) string {
+	tomlFile, err := os.CreateTemp("", "captive-core-integration-test-*.toml")
+	require.NoError(i.t, err)
+
+	tmpl, err := template.New("captive-core").Parse(captiveCoreConfigTemplate)
+	require.NoError(i.t, err)
+	err = tmpl.Execute(tomlFile, params)
+	require.NoError(i.t, err)
+
+	require.NoError(i.t, tomlFile.Close())
+
+	i.t.Cleanup(func() {
+		require.NoError(i.t, os.Remove(tomlFile.Name()))
+	})
+	return tomlFile.Name()
+}
+
 // Runs a docker-compose command applied to the above configs
-func (i *Test) runComposeCommand(args ...string) {
-	integrationYaml := filepath.Join(i.composePath, "docker-compose.integration-tests.yml")
-	integrationSorobanRPCYaml := filepath.Join(i.composePath, "docker-compose.integration-tests.soroban-rpc.yml")
-
-	cmdline := args
-	if i.config.EnableSorobanRPC {
-		cmdline = append([]string{"-f", integrationSorobanRPCYaml}, cmdline...)
-	}
-	cmdline = append([]string{"-f", integrationYaml}, cmdline...)
-	cmdline = append([]string{"compose"}, cmdline...)
+func (i *Test) runComposeCommand(envVars []string, args ...string) {
+	cmdline := append(
+		[]string{
+			"compose",
+			"-f",
+			filepath.Join(i.composePath, "docker-compose.integration-tests.yml"),
+		},
+		args...,
+	)
 	cmd := exec.Command("docker", cmdline...)
-	coreImageOverride := ""
-	if i.config.CoreDockerImage != "" {
-		coreImageOverride = i.config.CoreDockerImage
-	} else if img := os.Getenv("HORIZON_INTEGRATION_TESTS_DOCKER_IMG"); img != "" {
-		coreImageOverride = img
-	}
 
-	cmd.Env = os.Environ()
-	if coreImageOverride != "" {
-		cmd.Env = append(
-			cmd.Environ(),
-			fmt.Sprintf("CORE_IMAGE=%s", coreImageOverride),
-		)
-	}
-	sorobanRPCOverride := ""
-	if i.config.SorobanRPCDockerImage != "" {
-		sorobanRPCOverride = i.config.CoreDockerImage
-	} else if img := os.Getenv("HORIZON_INTEGRATION_TESTS_SOROBAN_RPC_DOCKER_IMG"); img != "" {
-		sorobanRPCOverride = img
-	}
-	if sorobanRPCOverride != "" {
-		cmd.Env = append(
-			cmd.Environ(),
-			fmt.Sprintf("SOROBAN_RPC_IMAGE=%s", sorobanRPCOverride),
-		)
-	}
+	cmd.Env = append(
+		envVars,
+		fmt.Sprintf("CAPTIVE_CORE_CONFIG_FILE=%s", i.rpcCoreConfPath),
+		fmt.Sprintf("CORE_CONFIG_FILE=%s", i.validatorConfPath),
+	)
 
 	i.t.Log("Running", cmd.Args)
 	out, innerErr := cmd.Output()
@@ -267,6 +313,57 @@ func (i *Test) runComposeCommand(args ...string) {
 	}
 }
 
+func (i *Test) startCoreValidator() {
+	var envVars []string
+	var coreImageOverride string
+
+	if i.config.CoreDockerImage != "" {
+		coreImageOverride = i.config.CoreDockerImage
+	} else if img := os.Getenv("HORIZON_INTEGRATION_TESTS_DOCKER_IMG"); img != "" {
+		coreImageOverride = img
+	}
+	if coreImageOverride != "" {
+		envVars = append(
+			envVars,
+			fmt.Sprintf("CORE_IMAGE=%s", coreImageOverride),
+		)
+	}
+
+	i.runComposeCommand(envVars, "up", "--detach", "--quiet-pull", "--no-color", "core")
+}
+
+func (i *Test) startRPC() {
+	var envVars []string
+	var stellarRPCOverride string
+
+	if i.config.StellarRPCDockerImage != "" {
+		stellarRPCOverride = i.config.CoreDockerImage
+	} else if img := os.Getenv("HORIZON_INTEGRATION_TESTS_STELLAR_RPC_DOCKER_IMG"); img != "" {
+		stellarRPCOverride = img
+	}
+	if stellarRPCOverride != "" {
+		envVars = append(
+			envVars,
+			fmt.Sprintf("STELLAR_RPC_IMAGE=%s", stellarRPCOverride),
+		)
+	}
+
+	i.runComposeCommand(envVars, "up", "--detach", "--quiet-pull", "--no-color", "stellar-rpc")
+}
+
+func (i *Test) removeContainers(containers ...string) {
+	i.runComposeCommand(
+		nil,
+		append(
+			[]string{
+				"rm",
+				"-fvs",
+			},
+			containers...,
+		)...,
+	)
+}
+
 func (i *Test) prepareShutdownHandlers() {
 	i.shutdownCalls = append(i.shutdownCalls,
 		func() {
@@ -277,11 +374,15 @@ func (i *Test) prepareShutdownHandlers() {
 				i.ingestNode.Close()
 			}
 			if !i.config.SkipCoreContainerCreation {
-				i.runComposeCommand("rm", "-fvs", "core")
-				i.runComposeCommand("rm", "-fvs", "core-postgres")
-				if i.config.EnableSorobanRPC {
-					i.runComposeCommand("logs", "soroban-rpc")
-					i.runComposeCommand("rm", "-fvs", "soroban-rpc")
+				if i.config.LogContainers {
+					i.runComposeCommand(nil, "logs", "core")
+				}
+				i.removeContainers("core")
+				if i.config.EnableStellarRPC {
+					if i.config.LogContainers {
+						i.runComposeCommand(nil, "logs", "stellar-rpc")
+					}
+					i.removeContainers("stellar-rpc")
 				}
 			}
 		},
@@ -341,6 +442,7 @@ func (i *Test) Shutdown() {
 // StartHorizon initializes and starts the Horizon client-facing API server.
 // When startIngestProcess=true, start a second process for ingest server
 func (i *Test) StartHorizon(startIngestProcess bool) error {
+	i.t.Logf("Starting horizon.....")
 	i.testDB = dbtest.Postgres(i.t)
 	i.shutdownCalls = append(i.shutdownCalls, func() {
 		if i.appStopped == nil {
@@ -436,14 +538,14 @@ func (i *Test) getDefaultArgs() map[string]string {
 	//       Compose YAML file itself rather than hardcoding it.
 	return map[string]string{
 		"ingest":               "false",
-		"history-archive-urls": fmt.Sprintf("http://%s:%d", "localhost", historyArchivePort),
+		"history-archive-urls": HistoryArchiveUrl,
 		"db-url":               i.testDB.RO_DSN,
 		"stellar-core-url":     i.coreClient.URL,
 		"network-passphrase":   i.passPhrase,
 		"apply-migrations":     "true",
-		"port":                 horizonDefaultPort,
+		"port":                 HorizonDefaultPort,
 		// due to ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING
-		"checkpoint-frequency": "8",
+		"checkpoint-frequency": strconv.Itoa(CheckpointFrequency),
 		"per-hour-rate-limit":  "0",  // disable rate limiting
 		"max-db-connections":   "50", // the postgres container supports 100 connections, be conservative
 	}
@@ -537,7 +639,7 @@ func (i *Test) setupHorizonAdminClient(ingestArgs map[string]string) error {
 
 func (i *Test) setupHorizonClient(webArgs map[string]string) {
 	hostname := "localhost"
-	horizonPort := horizonDefaultPort
+	horizonPort := HorizonDefaultPort
 	if port, ok := webArgs["port"]; ok {
 		horizonPort = port
 	}
@@ -545,6 +647,31 @@ func (i *Test) setupHorizonClient(webArgs map[string]string) {
 	i.horizonClient = &sdk.Client{
 		HorizonURL: fmt.Sprintf("http://%s:%s", hostname, horizonPort),
 	}
+}
+
+func (i *Test) CreateCaptiveCoreConfig() (*ledgerbackend.CaptiveCoreConfig, error) {
+	captiveCoreConfig := ledgerbackend.CaptiveCoreConfig{
+		BinaryPath:          i.CoreBinaryPath(),
+		HistoryArchiveURLs:  []string{HistoryArchiveUrl},
+		NetworkPassphrase:   StandaloneNetworkPassphrase,
+		CheckpointFrequency: CheckpointFrequency, // This is required for accelerated archive creation for integration test
+		UseDB:               true,
+		StoragePath:         i.CurrentTest().TempDir(),
+	}
+
+	tomlParams := ledgerbackend.CaptiveCoreTomlParams{
+		NetworkPassphrase:  StandaloneNetworkPassphrase,
+		HistoryArchiveURLs: []string{HistoryArchiveUrl},
+		UseDB:              true,
+	}
+
+	toml, err := ledgerbackend.NewCaptiveCoreTomlFromFile(i.coreConfig.configPath, tomlParams)
+	if err != nil {
+		return nil, err
+	}
+
+	captiveCoreConfig.Toml = toml
+	return &captiveCoreConfig, nil
 }
 
 const maxWaitForCoreStartup = 30 * time.Second
@@ -593,35 +720,35 @@ func (i *Test) waitForCore() {
 	i.t.Fatalf("Core could not sync after %v + %v", maxWaitForCoreStartup, maxWaitForCoreUpgrade)
 }
 
-const sorobanRPCInitTime = 20 * time.Second
-const sorobanRPCHealthCheckInterval = time.Second
+const stellarRPCInitTime = 60 * 6 * time.Second
+const stellarRPCHealthCheckInterval = time.Second
 
-// Wait for SorobanRPC to be up
-func (i *Test) waitForSorobanRPC() {
-	i.t.Log("Waiting for Soroban RPC to be up...")
+// Wait for stellar rpc to be up
+func (i *Test) waitForStellarRPC() {
+	i.t.Log("Waiting for Stellar RPC to be up...")
 
 	start := time.Now()
-	for time.Since(start) < sorobanRPCInitTime {
-		ctx, cancel := context.WithTimeout(context.Background(), sorobanRPCHealthCheckInterval)
+	for time.Since(start) < stellarRPCInitTime {
+		ctx, cancel := context.WithTimeout(context.Background(), stellarRPCHealthCheckInterval)
 		// TODO: soroban-tools should be exporting a proper Go client
-		ch := jhttp.NewChannel("http://localhost:"+strconv.Itoa(sorobanRPCPort), nil)
-		sorobanRPCClient := jrpc2.NewClient(ch, nil)
+		ch := jhttp.NewChannel("http://localhost:"+strconv.Itoa(StellarRPCPort), nil)
+		stellarRPCClient := jrpc2.NewClient(ch, nil)
 		callTime := time.Now()
-		_, err := sorobanRPCClient.Call(ctx, "getHealth", nil)
+		_, err := stellarRPCClient.Call(ctx, "getHealth", nil)
 		cancel()
 		if err != nil {
-			i.t.Logf("SorobanRPC is unhealthy: %v", err)
+			i.t.Logf("stellar rpc is unhealthy: %v", err)
 			// sleep up to a second between consecutive calls.
-			if durationSince := time.Since(callTime); durationSince < sorobanRPCHealthCheckInterval {
-				time.Sleep(sorobanRPCHealthCheckInterval - durationSince)
+			if durationSince := time.Since(callTime); durationSince < stellarRPCHealthCheckInterval {
+				time.Sleep(stellarRPCHealthCheckInterval - durationSince)
 			}
 			continue
 		}
-		i.t.Log("SorobanRPC is up.")
+		i.t.Log("stellar rpc is up.")
 		return
 	}
 
-	i.t.Fatalf("SorobanRPC unhealthy after %v", time.Since(start))
+	i.t.Fatalf("stellar rpc unhealthy after %v", time.Since(start))
 }
 
 type RPCSimulateHostFunctionResult struct {
@@ -669,14 +796,14 @@ func (i *Test) PreflightHostFunctions(
 func (i *Test) simulateTransaction(
 	sourceAccount txnbuild.Account, op txnbuild.Operation,
 ) (RPCSimulateTxResponse, xdr.SorobanTransactionData) {
-	// Before preflighting, make sure soroban-rpc is in sync with Horizon
+	// Before preflighting, make sure stellar-rpc is in sync with Horizon
 	root, err := i.horizonClient.Root()
 	assert.NoError(i.t, err)
-	i.syncWithSorobanRPC(uint32(root.HorizonSequence))
+	i.syncWithStellarRPC(uint32(root.HorizonSequence))
 
 	// TODO: soroban-tools should be exporting a proper Go client
-	ch := jhttp.NewChannel("http://localhost:"+strconv.Itoa(sorobanRPCPort), nil)
-	sorobanRPCClient := jrpc2.NewClient(ch, nil)
+	ch := jhttp.NewChannel("http://localhost:"+strconv.Itoa(StellarRPCPort), nil)
+	stellarRPCClient := jrpc2.NewClient(ch, nil)
 	txParams := GetBaseTransactionParamsWithFee(sourceAccount, txnbuild.MinBaseFee, op)
 	txParams.IncrementSequenceNum = false
 	tx, err := txnbuild.NewTransaction(txParams)
@@ -685,7 +812,7 @@ func (i *Test) simulateTransaction(
 	assert.NoError(i.t, err)
 	result := RPCSimulateTxResponse{}
 	fmt.Printf("Preflight TX:\n\n%v \n\n", base64)
-	err = sorobanRPCClient.CallResult(context.Background(), "simulateTransaction", struct {
+	err = stellarRPCClient.CallResult(context.Background(), "simulateTransaction", struct {
 		Transaction string `json:"transaction"`
 	}{base64}, &result)
 	assert.NoError(i.t, err)
@@ -697,25 +824,25 @@ func (i *Test) simulateTransaction(
 	return result, transactionData
 }
 
-func (i *Test) syncWithSorobanRPC(ledgerToWaitFor uint32) {
+func (i *Test) syncWithStellarRPC(ledgerToWaitFor uint32) {
 	for j := 0; j < 20; j++ {
 		result := struct {
 			Sequence uint32 `json:"sequence"`
 		}{}
-		ch := jhttp.NewChannel("http://localhost:"+strconv.Itoa(sorobanRPCPort), nil)
-		sorobanRPCClient := jrpc2.NewClient(ch, nil)
-		err := sorobanRPCClient.CallResult(context.Background(), "getLatestLedger", nil, &result)
+		ch := jhttp.NewChannel("http://localhost:"+strconv.Itoa(StellarRPCPort), nil)
+		stellarRPCClient := jrpc2.NewClient(ch, nil)
+		err := stellarRPCClient.CallResult(context.Background(), "getLatestLedger", nil, &result)
 		assert.NoError(i.t, err)
 		if result.Sequence >= ledgerToWaitFor {
 			return
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	i.t.Fatal("Time out waiting for soroban-rpc to sync")
+	i.t.Fatal("Time out waiting for stellar-rpc to sync")
 }
 
 func (i *Test) WaitUntilLedgerEntryTTL(ledgerKey xdr.LedgerKey) {
-	ch := jhttp.NewChannel("http://localhost:"+strconv.Itoa(sorobanRPCPort), nil)
+	ch := jhttp.NewChannel("http://localhost:"+strconv.Itoa(StellarRPCPort), nil)
 	client := jrpc2.NewClient(ch, nil)
 
 	keyB64, err := xdr.MarshalBase64(ledgerKey)
@@ -746,7 +873,7 @@ func (i *Test) WaitUntilLedgerEntryTTL(ledgerKey xdr.LedgerKey) {
 			}
 			i.t.Log("waiting for ledger entry to ttl at ledger", liveUntilLedgerSeq)
 		} else {
-			i.t.Log("waiting for soroban-rpc to ingest the ledger entries")
+			i.t.Log("waiting for stellar-rpc to ingest the ledger entries")
 		}
 		time.Sleep(time.Second)
 	}
@@ -821,6 +948,7 @@ func (i *Test) RestoreFootprint(
 
 // UpgradeProtocol arms Core with upgrade and blocks until protocol is upgraded.
 func (i *Test) UpgradeProtocol(version uint32) {
+	i.t.Logf("Attempting Core Protocol upgade to version: %v", version)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	err := i.coreClient.Upgrade(ctx, int(version))
 	cancel()
@@ -838,8 +966,14 @@ func (i *Test) UpgradeProtocol(version uint32) {
 			continue
 		}
 
+		ledgerSeq := info.Info.Ledger.Num
 		if info.Info.Ledger.Version == int(version) {
-			i.t.Logf("Protocol upgraded to: %d", info.Info.Ledger.Version)
+			i.t.Logf("Protocol upgraded to: %d, in ledger sequence number: %v, hash: %v",
+				info.Info.Ledger.Version, ledgerSeq, info.Info.Ledger.Hash)
+			// Mark the fact that the core has been upgraded as of this ledger sequence
+			// It could have been earlier than this, but certainly no later.
+			// The core upgrade could have happened in any ledger since the coreClient.Upgrade was issued
+			i.coreUpgradeState = &CoreUpgradeState{maxUpgradeLedger: uint32(ledgerSeq)}
 			return
 		}
 		time.Sleep(time.Second)
@@ -895,6 +1029,19 @@ func (i *Test) CoreClient() *stellarcore.Client {
 	return i.coreClient
 }
 
+func (i *Test) CoreBinaryPath() string {
+	if i.coreConfig.binaryPath != "" {
+		return i.coreConfig.binaryPath
+	}
+	corePath, err := exec.LookPath("stellar-core")
+	require.NoError(i.t, err)
+	return corePath
+}
+
+func (i *Test) CaptiveCoreStoragePath() string {
+	return i.coreConfig.storagePath
+}
+
 // Client returns horizon.Client connected to started Horizon instance.
 func (i *Test) Client() *sdk.Client {
 	return i.horizonClient
@@ -933,7 +1080,7 @@ func (i *Test) StopHorizon() {
 
 // AdminPort returns Horizon admin port.
 func (i *Test) AdminPort() int {
-	return adminPort
+	return AdminPort
 }
 
 // Metrics URL returns Horizon metrics URL.
@@ -1374,4 +1521,21 @@ func GetCoreMaxSupportedProtocol() uint32 {
 
 func (i *Test) GetEffectiveProtocolVersion() uint32 {
 	return i.config.ProtocolVersion
+}
+
+func GetHistoryArchive() (*historyarchive.Archive, error) {
+	return historyarchive.Connect(
+		HistoryArchiveUrl,
+		historyarchive.ArchiveOptions{
+			NetworkPassphrase:   StandaloneNetworkPassphrase,
+			CheckpointFrequency: CheckpointFrequency,
+		})
+}
+
+// This is approximate becuase the upgrade could have happened at a leger before this as well.
+func (i *Test) GetUpgradedLedgerSeqAppx() (uint32, error) {
+	if i.coreUpgradeState == nil {
+		return 0, errors.Errorf("Core has not been upgraded yet")
+	}
+	return i.coreUpgradeState.maxUpgradeLedger, nil
 }

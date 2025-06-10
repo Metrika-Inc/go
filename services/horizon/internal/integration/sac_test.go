@@ -41,7 +41,8 @@ func TestContractMintToAccount(t *testing.T) {
 
 	itest := integration.NewTest(t, integration.Config{
 		HorizonEnvironment: map[string]string{"INGEST_DISABLE_STATE_VERIFICATION": "true", "CONNECTION_TIMEOUT": "360000"},
-		EnableSorobanRPC:   true,
+		EnableStellarRPC:   true,
+		QuickExpiration:    true,
 	})
 
 	issuer := itest.Master().Address()
@@ -58,7 +59,7 @@ func TestContractMintToAccount(t *testing.T) {
 		itest.Master(),
 		mint(itest, issuer, asset, "20", accountAddressParam(recipient.GetAccountID())),
 	)
-
+	assertAccountInvokeHostFunctionOperation(itest, recipientKp.Address(), "", recipientKp.Address(), "20.0000000")
 	assertContainsBalance(itest, recipientKp, issuer, code, amount.MustParse("20"))
 	assertAssetStats(itest, assetStats{
 		code:                     code,
@@ -91,6 +92,7 @@ func TestContractMintToAccount(t *testing.T) {
 		itest.Master(),
 		transfer(itest, issuer, asset, "30", accountAddressParam(otherRecipient.GetAccountID())),
 	)
+	assertAccountInvokeHostFunctionOperation(itest, otherRecipientKp.Address(), issuer, otherRecipientKp.Address(), "30.0000000")
 	assertContainsBalance(itest, recipientKp, issuer, code, amount.MustParse("20"))
 	assertContainsBalance(itest, otherRecipientKp, issuer, code, amount.MustParse("30"))
 
@@ -144,7 +146,8 @@ func TestContractMintToContract(t *testing.T) {
 	}
 
 	itest := integration.NewTest(t, integration.Config{
-		EnableSorobanRPC: true,
+		EnableStellarRPC: true,
+		QuickExpiration:  true,
 	})
 
 	issuer := itest.Master().Address()
@@ -223,13 +226,14 @@ func TestExpirationAndRestoration(t *testing.T) {
 	}
 
 	itest := integration.NewTest(t, integration.Config{
-		EnableSorobanRPC: true,
+		EnableStellarRPC: true,
 		HorizonIngestParameters: map[string]string{
 			// disable state verification because we will insert
 			// a fake asset contract in the horizon db and we don't
 			// want state verification to detect this
 			"ingest-disable-state-verification": "true",
 		},
+		QuickExpiration: true,
 	})
 
 	issuer := itest.Master().Address()
@@ -501,7 +505,8 @@ func TestContractTransferBetweenAccounts(t *testing.T) {
 	}
 
 	itest := integration.NewTest(t, integration.Config{
-		EnableSorobanRPC: true,
+		EnableStellarRPC: true,
+		QuickExpiration:  true,
 	})
 
 	issuer := itest.Master().Address()
@@ -548,7 +553,8 @@ func TestContractTransferBetweenAccounts(t *testing.T) {
 		recipientKp,
 		transfer(itest, recipientKp.Address(), asset, "30", accountAddressParam(otherRecipient.GetAccountID())),
 	)
-
+	assertAccountInvokeHostFunctionOperation(itest, recipientKp.Address(), recipientKp.Address(), otherRecipientKp.Address(), "30.0000000")
+	assertAccountInvokeHostFunctionOperation(itest, otherRecipientKp.Address(), recipientKp.Address(), otherRecipientKp.Address(), "30.0000000")
 	assertContainsBalance(itest, recipientKp, issuer, code, amount.MustParse("970"))
 	assertContainsBalance(itest, otherRecipientKp, issuer, code, amount.MustParse("30"))
 
@@ -575,7 +581,8 @@ func TestContractTransferBetweenAccountAndContract(t *testing.T) {
 	}
 
 	itest := integration.NewTest(t, integration.Config{
-		EnableSorobanRPC: true,
+		EnableStellarRPC: true,
+		QuickExpiration:  true,
 	})
 
 	issuer := itest.Master().Address()
@@ -641,6 +648,7 @@ func TestContractTransferBetweenAccountAndContract(t *testing.T) {
 		recipientKp,
 		transfer(itest, recipientKp.Address(), asset, "30", contractAddressParam(recipientContractID)),
 	)
+	assertAccountInvokeHostFunctionOperation(itest, recipientKp.Address(), recipientKp.Address(), strkeyRecipientContractID, "30.0000000")
 	assertContainsBalance(itest, recipientKp, issuer, code, amount.MustParse("970"))
 	assertContainsEffect(t, getTxEffects(itest, transferTx, asset),
 		effects.EffectAccountDebited, effects.EffectContractCredited)
@@ -663,6 +671,7 @@ func TestContractTransferBetweenAccountAndContract(t *testing.T) {
 		recipientKp,
 		transferFromContract(itest, recipientKp.Address(), asset, recipientContractID, recipientContractHash, "500", accountAddressParam(recipient.GetAccountID())),
 	)
+	assertAccountInvokeHostFunctionOperation(itest, recipientKp.Address(), strkeyRecipientContractID, recipientKp.Address(), "500.0000000")
 	assertContainsEffect(t, getTxEffects(itest, transferTx, asset),
 		effects.EffectContractDebited, effects.EffectAccountCredited)
 	assertContainsBalance(itest, recipientKp, issuer, code, amount.MustParse("1470"))
@@ -695,7 +704,8 @@ func TestContractTransferBetweenContracts(t *testing.T) {
 	}
 
 	itest := integration.NewTest(t, integration.Config{
-		EnableSorobanRPC: true,
+		EnableStellarRPC: true,
+		QuickExpiration:  true,
 	})
 
 	issuer := itest.Master().Address()
@@ -776,7 +786,8 @@ func TestContractBurnFromAccount(t *testing.T) {
 	}
 
 	itest := integration.NewTest(t, integration.Config{
-		EnableSorobanRPC: true,
+		EnableStellarRPC: true,
+		QuickExpiration:  true,
 	})
 
 	issuer := itest.Master().Address()
@@ -820,6 +831,7 @@ func TestContractBurnFromAccount(t *testing.T) {
 		recipientKp,
 		burn(itest, recipientKp.Address(), asset, "500"),
 	)
+	assertAccountInvokeHostFunctionOperation(itest, recipientKp.Address(), recipientKp.Address(), "", "500.0000000")
 
 	fx := getTxEffects(itest, burnTx, asset)
 	require.Len(t, fx, 1)
@@ -851,7 +863,8 @@ func TestContractBurnFromContract(t *testing.T) {
 	}
 
 	itest := integration.NewTest(t, integration.Config{
-		EnableSorobanRPC: true,
+		EnableStellarRPC: true,
+		QuickExpiration:  true,
 	})
 
 	issuer := itest.Master().Address()
@@ -918,7 +931,8 @@ func TestContractClawbackFromAccount(t *testing.T) {
 	}
 
 	itest := integration.NewTest(t, integration.Config{
-		EnableSorobanRPC: true,
+		EnableStellarRPC: true,
+		QuickExpiration:  true,
 	})
 
 	// Give the master account the revocable flag (needed to set the clawback flag)
@@ -972,6 +986,7 @@ func TestContractClawbackFromAccount(t *testing.T) {
 		itest.Master(),
 		clawback(itest, issuer, asset, "1000", accountAddressParam(recipientKp.Address())),
 	)
+	assertAccountInvokeHostFunctionOperation(itest, recipientKp.Address(), recipientKp.Address(), "", "1000.0000000")
 
 	assertContainsEffect(t, getTxEffects(itest, clawTx, asset), effects.EffectAccountDebited)
 	assertContainsBalance(itest, recipientKp, issuer, code, 0)
@@ -995,7 +1010,8 @@ func TestContractClawbackFromContract(t *testing.T) {
 	}
 
 	itest := integration.NewTest(t, integration.Config{
-		EnableSorobanRPC: true,
+		EnableStellarRPC: true,
+		QuickExpiration:  true,
 	})
 
 	// Give the master account the revocable flag (needed to set the clawback flag)
@@ -1152,6 +1168,23 @@ func getTxEffects(itest *integration.Test, txHash string, asset xdr.Asset) []eff
 
 	assert.LessOrEqualf(t, len(result), 2, "txhash: %s", txHash)
 	return result
+}
+
+func assertAccountInvokeHostFunctionOperation(itest *integration.Test, account string, from string, to string, amount string) {
+	ops, err := itest.Client().Operations(horizonclient.OperationRequest{
+		ForAccount: account,
+		Limit:      1,
+		Order:      "desc",
+	})
+
+	assert.NoError(itest.CurrentTest(), err)
+	result := ops.Embedded.Records[0]
+	assert.Equal(itest.CurrentTest(), result.GetType(), operations.TypeNames[xdr.OperationTypeInvokeHostFunction])
+	invokeHostFn := result.(operations.InvokeHostFunction)
+	assert.Equal(itest.CurrentTest(), invokeHostFn.Function, "HostFunctionTypeHostFunctionTypeInvokeContract")
+	assert.Equal(itest.CurrentTest(), to, invokeHostFn.AssetBalanceChanges[0].To)
+	assert.Equal(itest.CurrentTest(), from, invokeHostFn.AssetBalanceChanges[0].From)
+	assert.Equal(itest.CurrentTest(), amount, invokeHostFn.AssetBalanceChanges[0].Amount)
 }
 
 func assertEventPayments(itest *integration.Test, txHash string, asset xdr.Asset, from string, to string, evtType string, amount string) {
