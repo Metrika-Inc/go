@@ -163,7 +163,6 @@ func (c *Client) stream(
 		if !(resp.StatusCode >= 200 && resp.StatusCode < 300) {
 			return fmt.Errorf("got bad HTTP status code %d", resp.StatusCode)
 		}
-		// defer resp.Body.Close()
 
 		reader := bufio.NewReader(resp.Body)
 
